@@ -119,7 +119,7 @@
   // this to the console -- and showing it in the topbar (see initializeAppView) -- makes it possible
   // to confirm at a glance whether a given device is actually on the latest deployed build before
   // spending time debugging something that's really just a stale cache/old copy.
-  window.WFM_APP_BUILD = "2026-10-13-v1.5";
+  window.WFM_APP_BUILD = "2026-10-14-v1.6";
   console.log("WFM CRM build:", window.WFM_APP_BUILD);
   // Turns a raw Firestore error into a plain-English hint about WHICH of the common causes it is,
   // so the on-screen sync banner is self-diagnosing instead of just saying "sync failed".
@@ -236,7 +236,7 @@
       console.log("Migrated legacy logs document into", weekKeys.length, "weekly documents.");
     } catch (e) { console.error("Log-week migration error:", e); logWeekMigrationAttempted = false; }
   }
-  onSnapshot(globalDocRef, (docSnap) => {    if (docSnap.exists()) {      const data = docSnap.data();      if (data.users) { users = data.users; safeStorage.setItem("wfm_users", JSON.stringify(users)); }      if (data.systemRoles) { systemRoles = data.systemRoles; safeStorage.setItem("wfm_system_roles", JSON.stringify(systemRoles)); }
+  onSnapshot(globalDocRef, (docSnap) => {    if (docSnap.exists()) {      const data = docSnap.data();      if (data.users) { users = (typeof window.__mergeIncomingUsers === 'function') ? window.__mergeIncomingUsers(data.users) : data.users; safeStorage.setItem("wfm_users", JSON.stringify(users)); }      if (data.systemRoles) { systemRoles = data.systemRoles; safeStorage.setItem("wfm_system_roles", JSON.stringify(systemRoles)); }
       // Sharded-logs bookkeeping: pick up the week index (which weekly logs_<week> documents
       // exist), run the one-time legacy migration if it hasn't happened yet, then start the live
       // listeners for the current rolling window of months.
@@ -463,7 +463,7 @@
   window.__refreshUsersFromCloud = async function () {
     try {
       const snap = await getDoc(globalDocRef);
-      if (snap.exists()) { const d = snap.data(); if (Array.isArray(d.users) && d.users.length) { users = d.users; safeStorage.setItem("wfm_users", JSON.stringify(users)); return true; } }
+      if (snap.exists()) { const d = snap.data(); if (Array.isArray(d.users) && d.users.length) { users = (typeof window.__mergeIncomingUsers === 'function') ? window.__mergeIncomingUsers(d.users) : d.users; safeStorage.setItem("wfm_users", JSON.stringify(users)); return true; } }
     } catch (e) { console.warn("User refresh failed:", e); }
     return false;
   };
@@ -683,15 +683,42 @@ async function __verifyPassword(user, pw){
    if(user && typeof user.password === "string" && user.password !== ""){ return { ok: String(user.password).trim() === pw, legacy: true }; }
    return { ok: false, legacy: false };
 }
+// Sets a password on the LIVE record in `users`. The cloud listener replaces the whole `users` array every time anyone's
+// status changes, so an object grabbed earlier (e.g. when the reset code was sent) can be a stale copy; changing that copy
+// silently loses the new password. Hash first, then re-find the live record and assign synchronously.
+async function __setPasswordFor(ref, pw, opts){
+   const tmp = {}; await __setPassword(tmp, pw);
+   const live = users.find(x => x && ((ref.id && x.id === ref.id) || (ref.username && x.username === ref.username)));
+   if(!live) return null;
+   live.passwordHash = tmp.passwordHash; live.passwordSalt = tmp.passwordSalt; live.passwordIter = tmp.passwordIter; live.passwordUpdatedAt = tmp.passwordUpdatedAt;
+   delete live.password;
+   if(opts && opts.requireReset !== undefined) live.requirePasswordReset = opts.requireReset;
+   return live;
+}
+// Merges the user list arriving from the cloud with this browser's copy: a password changed here more recently than the
+// incoming record's is kept, so a late/stale snapshot can't undo a reset that is still being saved.
+function __mergeIncomingUsers(incoming){
+   if(!Array.isArray(incoming)) return incoming;
+   const local = {}; (users || []).forEach(u => { if(u && u.id) local[u.id] = u; });
+   return incoming.map(u => {
+      const l = u && local[u.id];
+      if(l && (l.passwordUpdatedAt || 0) > (u.passwordUpdatedAt || 0)){
+         const m = Object.assign({}, u);
+         ["passwordHash","passwordSalt","passwordIter","passwordUpdatedAt","requirePasswordReset"].forEach(k => { if(l[k] !== undefined) m[k] = l[k]; else delete m[k]; });
+         delete m.password; return m;
+      }
+      return u;
+   });
+}
+window.__mergeIncomingUsers = __mergeIncomingUsers;
 // Converts every remaining plain-text password to a hash (run when an admin signs in).
 async function __migrateLegacyPasswords(){
    let changed = false;
    for(const u of users){
       if(u && typeof u.password === "string" && u.password){
          const old = u.password.trim();
-         await __setPassword(u, old);
-         if(__PUBLIC_DEFAULT_PASSWORDS.indexOf(old) !== -1) u.requirePasswordReset = true;
-         changed = true;
+         const live = await __setPasswordFor(u, old, __PUBLIC_DEFAULT_PASSWORDS.indexOf(old) !== -1 ? {requireReset:true} : undefined);
+         if(live) changed = true;
       }
    }
    if(changed) safeSaveAll();
@@ -732,7 +759,7 @@ async function login(__retried){   if(__retried !== true) syncStorageData();   c
   if(!found){ errEl.textContent = candidates.length ? "Invalid password. Please try again or use 'Reset Password?'." : "Account not found. Please check your email or username."; return; }
   try {
      // Upgrade a plain-text password to a hash on first successful sign-in; passwords that were visible in older builds must be changed.
-     if(verdict && verdict.legacy){ await __setPassword(found, pInput); if(__PUBLIC_DEFAULT_PASSWORDS.indexOf(pInput) !== -1) found.requirePasswordReset = true; safeSaveAll(); }
+     if(verdict && verdict.legacy){ const lv = await __setPasswordFor(found, pInput, __PUBLIC_DEFAULT_PASSWORDS.indexOf(pInput) !== -1 ? {requireReset:true} : undefined); if(lv){ found = lv; } safeSaveAll(); }
      else if(__PUBLIC_DEFAULT_PASSWORDS.indexOf(pInput) !== -1 && !found.requirePasswordReset){ found.requirePasswordReset = true; safeSaveAll(); }
      if(found.role === "admin") await __migrateLegacyPasswords();
   } catch(e){ console.error("Password upgrade failed:", e); }
@@ -746,7 +773,7 @@ async function login(__retried){   if(__retried !== true) syncStorageData();   c
   currentUser = found;   safeStorage.setItem("wfm_current_user_id", currentUser.username.toLowerCase());   safeSession.setItem("wfm_current_user", currentUser.username.toLowerCase());
   if(currentUser.requirePasswordReset){ document.getElementById("forceChangeModal").classList.remove("hidden"); return; }
   try { initializeAppView(); } catch(e){ document.getElementById("loginError").textContent = "Signed in, but the app failed to load (" + e.message + "). Check the browser console for details."; }}
-async function submitFirstLoginChange(){   const p1=document.getElementById("forceNewPass").value;   const p2=document.getElementById("forceConfirmPass").value;   if(!isStrongPassword(p1||"")){document.getElementById("forceError").textContent="Password must be at least 8 characters and include a letter, a number, and a special character.";return}   if(p1!==p2){document.getElementById("forceError").textContent="Passwords do not match.";return}   await __setPassword(currentUser, p1);   currentUser.requirePasswordReset=false;   safeSaveAll();   alert("Password successfully updated!");   document.getElementById("forceChangeModal").classList.add("hidden");   initializeAppView();}
+async function submitFirstLoginChange(){   const p1=document.getElementById("forceNewPass").value;   const p2=document.getElementById("forceConfirmPass").value;   if(!isStrongPassword(p1||"")){document.getElementById("forceError").textContent="Password must be at least 8 characters and include a letter, a number, and a special character.";return}   if(p1!==p2){document.getElementById("forceError").textContent="Passwords do not match.";return}   const __lv = await __setPasswordFor(currentUser, p1, {requireReset:false});   if(!__lv){ document.getElementById("forceError").textContent="Could not save the new password (account list changed). Please sign in again."; return; }   currentUser = __lv;   safeSaveAll();   alert("Password successfully updated!");   document.getElementById("forceChangeModal").classList.add("hidden");   initializeAppView();}
 function initializeAppView(){   syncStorageData();   claimSessionLock();   document.getElementById("loginScreen").classList.add("hidden");   document.getElementById("app").classList.remove("hidden");    const roleObj = getRoleObj(currentUser.role);   const roleLabel = roleObj ? roleObj.label : currentUser.role;   document.getElementById("roleBadge").textContent = roleLabel.toUpperCase();   document.getElementById("topUser").textContent = currentUser.name;    const buildBadgeEl = document.getElementById("buildBadge");   if(buildBadgeEl){ buildBadgeEl.textContent = "Build " + (window.WFM_APP_BUILD || "unknown"); }   const centerUserLabel = `${currentUser.name} (${roleLabel})`;   const centerElem = document.getElementById("centerUserNameRole");   if(centerElem){ centerElem.textContent = centerUserLabel; centerElem.title = centerUserLabel; }    const schedElem = document.getElementById("scheduleDate");   if(schedElem) schedElem.value = selectedDate;   const schedFromElem = document.getElementById("scheduleFromDate");   const schedToElem = document.getElementById("scheduleToDate");   if(schedFromElem) schedFromElem.value = selectedDate;   if(schedToElem) schedToElem.value = selectedDate;
   const reportFromElem = document.getElementById("reportFromDate");   const reportToElem = document.getElementById("reportToDate");   if(reportFromElem) reportFromElem.value = selectedDate;   if(reportToElem) reportToElem.value = selectedDate;   document.getElementById("historyDate").value=selectedDate;    const fromElem = document.getElementById("attendanceFromDate");   const toElem = document.getElementById("attendanceToDate");   if(fromElem) fromElem.value = selectedDate;   if(toElem) toElem.value = selectedDate;
   const savedAuxStateStr = safeStorage.getItem("wfm_user_aux_state_" + currentUser.username.toLowerCase());   let restoredSameDayState = false;   if(savedAuxStateStr){      try {         const savedAuxState = JSON.parse(savedAuxStateStr);         const savedDateStr = (savedAuxState && savedAuxState.startTime) ? toLocalDateStr(savedAuxState.startTime) : null;         if(savedAuxState && savedAuxState.auxKey && savedDateStr === today()){
@@ -799,7 +826,7 @@ function verifyOTP(){   const enteredOTP=document.getElementById("otpInput").val
 function isStrongPassword(pw){   return /^(?=.*[A-Za-z])(?=.*\d)(?=.*[^A-Za-z0-9\s]).{8,}$/.test(pw);}
 async function submitNewPassword(){   const p1=document.getElementById("newPassInput").value;   const p2=document.getElementById("confirmPassInput").value;   document.getElementById("resetError").textContent="";
   if(!isStrongPassword(p1)){ document.getElementById("resetError").textContent="Password must be at least 8 characters and include a letter, a number, and a special character."; return; }   if(p1!==p2){ document.getElementById("resetError").textContent="Passwords do not match."; return; }
-  await __setPassword(targetResetUser, p1);   targetResetUser.requirePasswordReset=false;   safeSaveAll();   alert("Password reset successful! You can now log in with your new password.");   closeResetModal();}
+  const __rv = await __setPasswordFor(targetResetUser, p1, {requireReset:false});   if(!__rv){ document.getElementById("resetError").textContent="Could not save the new password (account not found). Please start the reset again."; return; }   safeSaveAll();   alert("Password reset successful! You can now log in with your new password.");   closeResetModal();}
 function switchPlotMode(){   activePlotMode=document.getElementById("plotModeSelect").value;   if(activePlotMode==="timeline"){      document.getElementById("timelinePlotWrap").classList.remove("hidden");      document.getElementById("grid15mPlotWrap").classList.add("hidden");   } else {      document.getElementById("timelinePlotWrap").classList.add("hidden");      document.getElementById("grid15mPlotWrap").classList.remove("hidden");   }   renderPlot();}
 function openTimePlotModal(agentId, clickedMin){   targetPlotAgentId=agentId;   const agent=users.find(u=>u.id===agentId || u.username===agentId);   document.getElementById("modalAgentName").textContent=agent?.name||"Agent";   const sel=document.getElementById("modalAuxSelect");   sel.innerHTML=ALL_AUX.map(a=>`<option value="${a.key}">${a.label}</option>`).join("");   sel.value=selectedAux;   const startH=Math.floor(clickedMin/60), startM=clickedMin%60;   const endMin=Math.min(1440, clickedMin+60);   const endH=Math.floor(endMin/60), endM=endMin%60;   document.getElementById("modalStartTime").value=`${String(startH).padStart(2,"0")}:${String(startM).padStart(2,"0")}`;   document.getElementById("modalEndTime").value=`${String(endH).padStart(2,"0")}:${String(endM).padStart(2,"0")}`;   document.getElementById("plotError").textContent="";   document.getElementById("timePlotModal").classList.remove("hidden");}
 function closeTimePlotModal(){ document.getElementById("timePlotModal").classList.add("hidden");}
@@ -1101,7 +1128,7 @@ function createCustomRole(){   if(!isWriteAdmin()) return alert("Only WFM Admin 
   if(!key || !label){ return alert("Please enter both Role Key/ID and Role Display Label."); }   if(systemRoles.some(r => r.key === key)){ return alert("A role with key '" + key + "' already exists."); }
   const newRole = {      key: key,      label: label,      accessMode: accessMode,      canEdit: (accessMode === "write"),      canViewAll: (accessMode === "write" || accessMode === "read"),      canDownload: (accessMode === "write" || accessMode === "read"),      canAdmin: (accessMode === "write")   };
   systemRoles.push(newRole);   ROLE_OPTIONS = systemRoles.map(r => r.label);   safeSaveAll();   renderSettings();   renderAdmin();   document.getElementById("newRoleKey").value = "";   document.getElementById("newRoleLabel").value = "";   alert("Role '" + label + "' created and saved successfully!");}
-async function editPassword(id){   const user=users.find(u=>u.id===id);   if(!user) return;   const newPass=prompt(`Set a new temporary password for '${user.name}' (${user.username}).\nMin 8 characters with a letter, a number and a symbol. The user will be asked to change it at next sign-in.`, "");   if(newPass===null) return;   if(!isStrongPassword(newPass)){ alert("Password must be at least 8 characters and include a letter, a number, and a special character."); return; }   await __setPassword(user, newPass);   user.requirePasswordReset=true;   safeSaveAll(); renderAdmin();   alert(`Password for '${user.name}' updated. They must change it at next sign-in.`);}
+async function editPassword(id){   const user=users.find(u=>u.id===id);   if(!user) return;   const newPass=prompt(`Set a new temporary password for '${user.name}' (${user.username}).\nMin 8 characters with a letter, a number and a symbol. The user will be asked to change it at next sign-in.`, "");   if(newPass===null) return;   if(!isStrongPassword(newPass)){ alert("Password must be at least 8 characters and include a letter, a number, and a special character."); return; }   const __ev = await __setPasswordFor(user, newPass, {requireReset:true});   if(!__ev){ alert("Could not save: user list changed. Please try again."); return; }   safeSaveAll(); renderAdmin();   alert(`Password for '${user.name}' updated. They must change it at next sign-in.`);}
 function addAgent(){ openAddUserModal(); }
 function openAddUserModal(){
    if(!isWriteAdmin()) return alert("Only WFM Admin can create new users.");
