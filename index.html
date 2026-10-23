@@ -119,7 +119,7 @@
   // this to the console -- and showing it in the topbar (see initializeAppView) -- makes it possible
   // to confirm at a glance whether a given device is actually on the latest deployed build before
   // spending time debugging something that's really just a stale cache/old copy.
-  window.WFM_APP_BUILD = "2026-10-14-v1.6";
+  window.WFM_APP_BUILD = "2026-10-23-v1.7";
   console.log("WFM CRM build:", window.WFM_APP_BUILD);
   // Turns a raw Firestore error into a plain-English hint about WHICH of the common causes it is,
   // so the on-screen sync banner is self-diagnosing instead of just saying "sync failed".
@@ -236,7 +236,19 @@
       console.log("Migrated legacy logs document into", weekKeys.length, "weekly documents.");
     } catch (e) { console.error("Log-week migration error:", e); logWeekMigrationAttempted = false; }
   }
-  onSnapshot(globalDocRef, (docSnap) => {    if (docSnap.exists()) {      const data = docSnap.data();      if (data.users) { users = (typeof window.__mergeIncomingUsers === 'function') ? window.__mergeIncomingUsers(data.users) : data.users; safeStorage.setItem("wfm_users", JSON.stringify(users)); }      if (data.systemRoles) { systemRoles = data.systemRoles; safeStorage.setItem("wfm_system_roles", JSON.stringify(systemRoles)); }
+  onSnapshot(globalDocRef, (docSnap) => {    if (!docSnap.exists()) { window.__centralLoaded = true; window.__cloudUserCount = 0; }    if (docSnap.exists()) {      const data = docSnap.data();      window.__centralLoaded = true;
+      if (Array.isArray(data.users)) { window.__cloudUserCount = data.users.length; }
+      if (data.users) {
+        // Keep a local safety copy of the user list before replacing it, and always when the incoming list is much shorter
+        // (e.g. another device overwrote the cloud list): Admin -> "Restore users" can bring them back.
+        try {
+          const __cur = Array.isArray(users) ? users : [];
+          const __old = JSON.parse(safeStorage.getItem("wfm_users_backup") || "[]");
+          const __shrunk = data.users.length < __cur.length * 0.5;
+          if (__cur.length >= 3 && (__shrunk || __cur.length >= __old.length)) { safeStorage.setItem("wfm_users_backup", JSON.stringify(__cur)); }
+        } catch (e) {}
+        users = (typeof window.__mergeIncomingUsers === 'function') ? window.__mergeIncomingUsers(data.users) : data.users; safeStorage.setItem("wfm_users", JSON.stringify(users));
+      }      if (data.systemRoles) { systemRoles = data.systemRoles; safeStorage.setItem("wfm_system_roles", JSON.stringify(systemRoles)); }
       // Sharded-logs bookkeeping: pick up the week index (which weekly logs_<week> documents
       // exist), run the one-time legacy migration if it hasn't happened yet, then start the live
       // listeners for the current rolling window of months.
@@ -322,7 +334,13 @@
     // Calling Leads and Agent Login Location/IP Logs have been removed entirely (per request) --
     // neither their data nor any capture code is synced to Firestore any more, cutting storage/
     // bandwidth use accordingly.
-    const centralState = {      users: typeof users !== 'undefined' ? users : [],      systemRoles: typeof systemRoles !== 'undefined' ? systemRoles : [],      logWeekIndex: logWeekIndex    };
+    // Safety: never overwrite the cloud user list from a browser that has not loaded it yet, or that holds an empty / admin-only
+    // list while the cloud has several users. (setDoc merge keeps the cloud's list when `users` is left out.)
+    const __localUsers = (typeof users !== 'undefined' && Array.isArray(users)) ? users : [];
+    const __cloudN = window.__cloudUserCount || 0;
+    const __usersSafe = window.__centralLoaded === true && !(__localUsers.length === 0 && __cloudN > 0) && !(__localUsers.length <= 1 && __cloudN >= 3);
+    if (!__usersSafe) { console.warn("User list NOT written to the cloud (this browser's list looks incomplete: local " + __localUsers.length + ", cloud " + __cloudN + ")."); window.__usersWriteBlocked = true; } else { window.__usersWriteBlocked = false; }
+    const centralState = {      ...(__usersSafe ? { users: __localUsers } : {}),      systemRoles: typeof systemRoles !== 'undefined' ? systemRoles : [],      logWeekIndex: logWeekIndex    };
     const schedulesState = {      continuousSchedules: typeof continuousSchedules !== 'undefined' ? continuousSchedules : {},      grid15mSchedules: typeof grid15mSchedules !== 'undefined' ? grid15mSchedules : {}    };
 
     // Persist to localStorage IMMEDIATELY and SYNCHRONOUSLY (not just after the Firestore
@@ -330,7 +348,7 @@
     // previously, syncStorageData() could overwrite fresh in-memory data with a stale
     // localStorage snapshot while a save was still in flight.
     try {
-      safeStorage.setItem("wfm_users", JSON.stringify(centralState.users));
+      safeStorage.setItem("wfm_users", JSON.stringify(__localUsers));
       safeStorage.setItem("wfm_system_roles", JSON.stringify(centralState.systemRoles));
       safeStorage.setItem("wfm_continuous_schedules", JSON.stringify(schedulesState.continuousSchedules));
       safeStorage.setItem("wfm_grid15m_schedules", JSON.stringify(schedulesState.grid15mSchedules));
@@ -477,7 +495,7 @@
    <!-- SUB-TAB TOGGLES FOR ATTENDANCE & ACTIVITY LOGS -->   <div class="sub-tabs">    <button id="subTabSummary" class="sub-tab active" onclick="switchAttendanceSubTab('summary')">Daily Summary Logs</button>    <button id="subTabActivity" class="sub-tab" onclick="switchAttendanceSubTab('activity')">Agent Activity Logs</button>   </div>
    <!-- SUB-PANEL 1: DAILY SUMMARY LOGS -->   <div id="attendanceSummaryView">    <h3 style="margin-top:0">Agent Daily First Login & Last Logout Logs</h3>    <div class="table-scroll"><table class="data-table"><thead><tr>     <th>Agent Name</th><th>Username / Email</th><th>Start Date</th><th>End Date</th><th>Assigned Shift</th><th>Assigned Shift AUX Code</th>     <th>First Available AUX Timestamp</th><th>Last Offline AUX Timestamp</th><th>Contact</th>    </tr></thead><tbody id="attendanceBody"></tbody></table></div>   </div>
    
-   <!-- SUB-PANEL 4: AGENT ACTIVITY LOGS (every AUX change, with device) -->   <div id="attendanceActivityView" class="hidden">    <h3 style="margin-top:0">Agent Activity Logs — Every AUX Change</h3>    <div class="table-scroll"><table class="data-table"><thead><tr>     <th>Agent Name</th><th>Username / Email</th><th>AUX Status</th><th>Start Date</th><th>Start Time</th><th>End Time</th><th>Duration</th><th>Device</th>    </tr></thead><tbody id="activityBody"></tbody></table></div>   </div>  </div> </section> <!-- ADMIN --> <section id="adminSection" class="hidden">  <div class="card">   <h3>Agent & Credential Management</h3>   <div class="table-scroll"><table class="data-table"><thead><tr>    <th>Name</th><th>Email</th><th>Phone</th><th>Contact</th><th>Agency</th><th>Department</th><th>Queue</th><th>Status</th><th>Date of Hire</th><th>Date of Exit</th><th>Shift (Auto)</th><th>Role</th><th>Action</th>   </tr></thead><tbody id="adminBody"></tbody></table></div>  </div> </section> <!-- SETTINGS TAB (ROLE MANAGEMENT & PERMISSIONS CONFIGURATION) --> <section id="settingsSection" class="hidden">  <div class="card">   <h2 style="margin-top:0;margin-bottom:6px">System Role & Access Settings</h2>   <p style="color:var(--muted);font-size:13px;margin-top:0;margin-bottom:18px">    Configure end-to-end Read/Write permissions for WFM Admin, Team Leaders, Agents, and Custom System Roles.   </p>   <div style="display:grid;grid-template-columns:1fr 2fr;gap:18px">    <div style="background:#f8fafc;padding:16px;border-radius:12px;border:1px solid var(--border)">     <h3 style="margin-top:0;font-size:15px">Create New System Role</h3>     <div class="field">      <label>Role Key / ID</label>      <input id="newRoleKey" placeholder="e.g. team_leader">     </div>     <div class="field">      <label>Role Display Label</label>      <input id="newRoleLabel" placeholder="e.g. Team Leader">     </div>     <div class="field">      <label>Access Matrix Mode</label>      <select id="newRoleAccessMode">       <option value="write">Full Read & Write Access (WFM Admin)</option>       <option value="read">View & Download All Agents Access (Team Leader)</option>       <option value="agent">Self Only Access (Agent)</option>      </select>     </div>     <button class="primary" style="width:100%;margin-top:8px" onclick="createCustomRole()">+ Create & Save Role</button>    </div>    <div>     <h3 style="margin-top:0;font-size:15px">Configured Role Permissions Matrix</h3>     <div class="table-scroll">      <table class="data-table">       <thead>        <tr>         <th>Role Name</th>         <th>Role ID</th>         <th>Schedule Plotter</th>         <th>Reporting & Attendance</th>         <th>CSV / Excel Downloads</th>         <th>System Settings</th>        </tr>       </thead>       <tbody id="rolesTableBody"></tbody>      </table>     </div>    </div>   </div>  </div> </section></main></section><script>/* LOCAL FALLBACK STORAGE WRAPPER */const __memoryStore = {};function __getRealStorage(kind){ try { const s = window[kind]; const testKey = "__wfm_storage_test__"; s.setItem(testKey, "1"); s.removeItem(testKey); return s; } catch(e){ return null; }}const __realLocal = __getRealStorage('localStorage');const __realSession = __getRealStorage('sessionStorage');
+   <!-- SUB-PANEL 4: AGENT ACTIVITY LOGS (every AUX change, with device) -->   <div id="attendanceActivityView" class="hidden">    <h3 style="margin-top:0">Agent Activity Logs — Every AUX Change</h3>    <div class="table-scroll"><table class="data-table"><thead><tr>     <th>Agent Name</th><th>Username / Email</th><th>AUX Status</th><th>Start Date</th><th>Start Time</th><th>End Time</th><th>Duration</th><th>Device</th>    </tr></thead><tbody id="activityBody"></tbody></table></div>   </div>  </div> </section> <!-- ADMIN --> <section id="adminSection" class="hidden">  <div class="card">   <h3>Agent & Credential Management</h3>   <div id="userRecoveryBar" class="hidden" style="background:#fff7ed;border:1px solid #fdba74;color:#7c2d12;padding:10px 12px;border-radius:10px;margin:8px 0 12px;font-size:13px;gap:10px;align-items:center;flex-wrap:wrap"></div>   <div class="table-scroll"><table class="data-table"><thead><tr>    <th>Name</th><th>Email</th><th>Phone</th><th>Contact</th><th>Agency</th><th>Department</th><th>Queue</th><th>Status</th><th>Date of Hire</th><th>Date of Exit</th><th>Shift (Auto)</th><th>Role</th><th>Action</th>   </tr></thead><tbody id="adminBody"></tbody></table></div>  </div> </section> <!-- SETTINGS TAB (ROLE MANAGEMENT & PERMISSIONS CONFIGURATION) --> <section id="settingsSection" class="hidden">  <div class="card">   <h2 style="margin-top:0;margin-bottom:6px">System Role & Access Settings</h2>   <p style="color:var(--muted);font-size:13px;margin-top:0;margin-bottom:18px">    Configure end-to-end Read/Write permissions for WFM Admin, Team Leaders, Agents, and Custom System Roles.   </p>   <div style="display:grid;grid-template-columns:1fr 2fr;gap:18px">    <div style="background:#f8fafc;padding:16px;border-radius:12px;border:1px solid var(--border)">     <h3 style="margin-top:0;font-size:15px">Create New System Role</h3>     <div class="field">      <label>Role Key / ID</label>      <input id="newRoleKey" placeholder="e.g. team_leader">     </div>     <div class="field">      <label>Role Display Label</label>      <input id="newRoleLabel" placeholder="e.g. Team Leader">     </div>     <div class="field">      <label>Access Matrix Mode</label>      <select id="newRoleAccessMode">       <option value="write">Full Read & Write Access (WFM Admin)</option>       <option value="read">View & Download All Agents Access (Team Leader)</option>       <option value="agent">Self Only Access (Agent)</option>      </select>     </div>     <button class="primary" style="width:100%;margin-top:8px" onclick="createCustomRole()">+ Create & Save Role</button>    </div>    <div>     <h3 style="margin-top:0;font-size:15px">Configured Role Permissions Matrix</h3>     <div class="table-scroll">      <table class="data-table">       <thead>        <tr>         <th>Role Name</th>         <th>Role ID</th>         <th>Schedule Plotter</th>         <th>Reporting & Attendance</th>         <th>CSV / Excel Downloads</th>         <th>System Settings</th>        </tr>       </thead>       <tbody id="rolesTableBody"></tbody>      </table>     </div>    </div>   </div>  </div> </section></main></section><script>/* LOCAL FALLBACK STORAGE WRAPPER */const __memoryStore = {};function __getRealStorage(kind){ try { const s = window[kind]; const testKey = "__wfm_storage_test__"; s.setItem(testKey, "1"); s.removeItem(testKey); return s; } catch(e){ return null; }}const __realLocal = __getRealStorage('localStorage');const __realSession = __getRealStorage('sessionStorage');
 const safeStorage = {  getItem(key){ try { if(__realLocal) return __realLocal.getItem(key); } catch(e){} return __memoryStore.hasOwnProperty(key) ? __memoryStore[key] : null; },  setItem(key, val){     try { if(__realLocal){ __realLocal.setItem(key, val); } } catch(e){}     __memoryStore[key] = val;   },  removeItem(key){     try { if(__realLocal){ __realLocal.removeItem(key); } } catch(e){}     delete __memoryStore[key];   }};
 const safeSession = {  getItem(key){ try { if(__realSession) return __realSession.getItem(key); } catch(e){} return __memoryStore.hasOwnProperty('s_' + key) ? __memoryStore['s_' + key] : null; },  setItem(key, val){ try { if(__realSession){ __realSession.setItem(key, val); return; } } catch(e){} __memoryStore['s_' + key] = val; },  removeItem(key){ try { if(__realSession){ __realSession.removeItem(key); } } catch(e){} delete __memoryStore['s_' + key]; }};
 /* Safe wrapper around the cloud-sync module's window.saveAll(). window.saveAll is only defined
@@ -711,6 +729,72 @@ function __mergeIncomingUsers(incoming){
    });
 }
 window.__mergeIncomingUsers = __mergeIncomingUsers;
+
+// ---------- Admin: user recovery tools ----------
+function __idSet(u){ const out = new Set(); [u && u.id, u && u.username, u && u.email].forEach(v => { if(v){ const l = String(v).trim().toLowerCase(); out.add(l); out.add(l.replace(/^external-/, "")); } }); return out; }
+function __knownUserIds(){ const known = new Set(); (users || []).forEach(u => __idSet(u).forEach(x => known.add(x))); return known; }
+function __getUserBackup(){ try { const b = JSON.parse(safeStorage.getItem("wfm_users_backup") || "[]"); return Array.isArray(b) ? b : []; } catch(e){ return []; } }
+function __backupOnlyUsers(){ const known = __knownUserIds(); return __getUserBackup().filter(u => u && !Array.from(__idSet(u)).some(x => known.has(x))); }
+function __prettyName(local){ return String(local||"").replace(/^external-/, "").split("@")[0].replace(/[._-]+/g, " ").replace(/\b\w/g, c => c.toUpperCase()).trim() || local; }
+// Finds people who appear in live status, AUX logs or schedules but have no account (e.g. the user list was overwritten).
+function __activityCandidates(){
+   const known = __knownUserIds(); const found = {};
+   const consider = (key, info) => {
+      key = String(key||"").trim().toLowerCase();
+      if(!key || key.indexOf("@") < 0) return;
+      const norm = key.replace(/^external-/, "");
+      if(known.has(key) || known.has(norm)) return;
+      if(info && info.userRole === "admin") return; // never create an admin from activity data
+      if(!found[norm]) found[norm] = { username: (info && info.username) || key, email: (info && info.email) || key, name: (info && info.name) || __prettyName(key), role: (info && info.userRole && info.userRole !== "admin") ? info.userRole : "agent" };
+   };
+   try { const ls = JSON.parse(safeStorage.getItem("wfm_live_agent_status") || "{}"); Object.keys(ls).forEach(k => consider(ls[k] && ls[k].username || k, ls[k])); } catch(e){}
+   const scanKeys = m => Object.keys(m || {}).forEach(k => { const i = k.indexOf("_"); if(i === 10) consider(k.slice(11), null); });
+   scanKeys(auxLogs); scanKeys(continuousSchedules); scanKeys(grid15mSchedules);
+   return Object.keys(found).map(k => found[k]);
+}
+function __refreshRecoveryBar(){
+   const bar = document.getElementById("userRecoveryBar"); if(!bar) return;
+   const nb = __backupOnlyUsers().length, nc = __activityCandidates().length;
+   if(!nb && !nc){ bar.classList.add("hidden"); bar.style.display = "none"; return; }
+   bar.classList.remove("hidden"); bar.style.display = "flex";
+   bar.innerHTML = `<b>Some people are missing from the user list.</b> ` +
+      (nb ? `<button class="btn" onclick="restoreUsersFromBackup()">Restore ${nb} user(s) from this device's backup</button> ` : "") +
+      (nc ? `<button class="btn" onclick="recoverUsersFromActivity()">Recover ${nc} person(s) from activity history</button>` : "");
+}
+function restoreUsersFromBackup(){
+   if(!isWriteAdmin()) return;
+   const add = __backupOnlyUsers();
+   if(!add.length){ alert("Nothing to restore."); return; }
+   if(!confirm(`Restore ${add.length} user(s) from the backup kept on this device?\n\n` + add.slice(0, 20).map(u => "- " + (u.name || u.username)).join("\n") + (add.length > 20 ? "\n..." : "") + "\n\nTheir existing passwords are kept.")) return;
+   add.forEach(u => users.push(u));
+   safeSaveAll(); populateFilters(); renderPlot(); renderAdmin();
+   alert(`${add.length} user(s) restored.`);
+}
+function __randomTempPassword(){
+   const a = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz", d = "23456789", sy = "#@$%&*!";
+   const pick = (set, n) => { const r = crypto.getRandomValues(new Uint32Array(n)); let o = ""; for(let i = 0; i < n; i++) o += set[r[i] % set.length]; return o; };
+   const pw = pick(a, 6) + pick(d, 3) + pick(sy, 1) + pick(a, 2);
+   return isStrongPassword(pw) ? pw : __randomTempPassword();
+}
+async function recoverUsersFromActivity(){
+   if(!isWriteAdmin()) return;
+   const cands = __activityCandidates();
+   if(!cands.length){ alert("No missing people found in activity history."); return; }
+   if(!confirm(`Create accounts for ${cands.length} person(s) found in activity history?\n\n` + cands.slice(0, 20).map(c => "- " + c.name + " (" + c.username + ")").join("\n") + (cands.length > 20 ? "\n..." : "") + "\n\nEach gets a temporary password (downloaded as a file) and must change it at first sign-in. Queue, department and phone are not known: please set them in Admin afterwards.")) return;
+   const rows = [["Name","Username","Temporary password"]];
+   for(const c of cands){
+      const pw = __randomTempPassword();
+      const u = { id: String(c.email || c.username).toLowerCase(), name: c.name, username: c.username, email: c.email, phone: "", role: c.role, agency: /^external-/i.test(c.username) ? "external" : "internal", unit: "CS Delivery", department: "CS Delivery", queue: "Livechat", shift: "09:00-18:00", requirePasswordReset: true, status: "active", dateOfHire: "", dateOfExit: "" };
+      await __setPassword(u, pw);
+      users.push(u); rows.push([c.name, c.username, pw]);
+   }
+   safeSaveAll(); populateFilters(); renderPlot(); renderAdmin();
+   try {
+      const blob = new Blob([rows.map(r => r.map(csv).join(",")).join("\n")], { type: "text/csv" });
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "recovered_users_temporary_passwords.csv"; document.body.appendChild(a); a.click(); a.remove();
+   } catch(e){}
+   alert(`${cands.length} account(s) created. Share each temporary password securely and delete the downloaded file afterwards.`);
+}
 // Converts every remaining plain-text password to a hash (run when an admin signs in).
 async function __migrateLegacyPasswords(){
    let changed = false;
@@ -726,6 +810,7 @@ async function __migrateLegacyPasswords(){
 // One-time recovery: creates the first admin ONLY when no users exist anywhere (local or cloud). Run from the browser console: __createFirstAdmin("email","StrongPass#1")
 window.__createFirstAdmin = async function(email, pw){
    email = String(email||"").trim(); 
+   if(window.__centralLoaded !== true){ console.error("Cloud user list has not loaded yet - wait a few seconds and try again (nothing was created)."); return false; }
    if(window.__refreshUsersFromCloud) await window.__refreshUsersFromCloud();
    if(users && users.length){ console.error("Users already exist - first admin not created."); return false; }
    if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || !isStrongPassword(pw||"")){ console.error("Valid email and a strong password (8+ chars, letter, number, symbol) required."); return false; }
@@ -1112,7 +1197,7 @@ function getAgentDynamicShifts(user, targetDate){   const shiftsSet = new Set();
   if(user && user.shift && user.shift !== "Shift N/A"){ shiftsSet.add(user.shift); }   const defaultShifts = ["07:00-16:00", "08:00-17:00", "09:00-18:00", "11:00-20:00", "15:00-00:00", "23:00-08:00"];   defaultShifts.forEach(s => shiftsSet.add(s));   return Array.from(shiftsSet);}
 function updateAdminUserField(userId, fieldName, newValue){   const user = users.find(u => u.id === userId);   if(user){      user[fieldName] = newValue;      if(fieldName === "department") user.unit = newValue;      if(fieldName === "unit") user.department = newValue;      if(fieldName === "email") user.username = newValue;      safeSaveAll();      populateFilters();      renderPlot();      renderDashboard();      if(typeof renderAttendance === 'function' && document.getElementById('attendanceSection') && !document.getElementById('attendanceSection').classList.contains('hidden')){ renderAttendance(); }      if(fieldName === 'status' || fieldName === 'name' || fieldName === 'email'){ renderAdmin(); }   }}
 /* Derives the agent's shift purely from what's actually plotted in the Schedule Plotter (continuousSchedules) — no manual/default fallback. Returns null if nothing has ever been plotted for this agent. */function getAgentPlottedShiftDisplay(user){   const ids = getAgentIdentifiers(user);   let bestDate = null;   let bestRange = null;   Object.keys(continuousSchedules).forEach(key => {      const blocks = continuousSchedules[key];      if(!blocks || blocks.length === 0) return;      const parts = key.split("_");      if(parts.length < 2) return;      const datePart = parts[0];      const keyUserId = parts.slice(1).join("_").toLowerCase();      if(!ids.has(keyUserId)) return;      let minStart = 1440, maxEnd = 0;      blocks.forEach(b => {         if(b.startMin < minStart) minStart = b.startMin;         if(b.endMin > maxEnd) maxEnd = b.endMin;      });      if(minStart >= maxEnd) return;      if(!bestDate || datePart > bestDate){         bestDate = datePart;         bestRange = timeLabel(minStart) + "-" + (maxEnd === 1440 ? "00:00" : timeLabel(maxEnd));      }   });   return bestRange;}
-function renderAdmin(){   if(!currentUser||!isWriteAdmin())return;   document.getElementById("adminBody").innerHTML=users.map(u=>{      const currAgency = u.agency || "internal";      const currDept = u.department || u.unit || "WFM";      const currQueue = u.queue || "Livechat";      const currRoleKey = u.role || "agent";    const currPhone = u.phone || "";
+function renderAdmin(){   if(!currentUser||!isWriteAdmin())return;   try { __refreshRecoveryBar(); } catch(e){ console.error(e); }   document.getElementById("adminBody").innerHTML=users.map(u=>{      const currAgency = u.agency || "internal";      const currDept = u.department || u.unit || "WFM";      const currQueue = u.queue || "Livechat";      const currRoleKey = u.role || "agent";    const currPhone = u.phone || "";
     let agencyOpts = AGENCY_OPTIONS.map(opt => `<option value="${esc(opt)}" ${opt.toLowerCase()===currAgency.toLowerCase()?'selected':''}>${esc(opt)}</option>`).join("");      if(!AGENCY_OPTIONS.some(opt => opt.toLowerCase() === currAgency.toLowerCase())){ agencyOpts += `<option value="${esc(currAgency)}" selected>${esc(currAgency)}</option>`; }
     let deptOpts = DEPARTMENT_OPTIONS.map(opt => `<option value="${esc(opt)}" ${opt.toLowerCase()===currDept.toLowerCase()?'selected':''}>${esc(opt)}</option>`).join("");      if(!DEPARTMENT_OPTIONS.some(opt => opt.toLowerCase() === currDept.toLowerCase())){ deptOpts += `<option value="${esc(currDept)}" selected>${esc(currDept)}</option>`; }
     let queueOpts = QUEUE_OPTIONS.map(opt => `<option value="${esc(opt)}" ${opt.toLowerCase()===currQueue.toLowerCase()?'selected':''}>${esc(opt)}</option>`).join("");      if(!QUEUE_OPTIONS.some(opt => opt.toLowerCase() === currQueue.toLowerCase())){ queueOpts += `<option value="${esc(currQueue)}" selected>${esc(currQueue)}</option>`; }
